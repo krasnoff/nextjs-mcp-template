@@ -1,16 +1,16 @@
 import { NextRequest } from 'next/server';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from './services/mcp-server';
 
 // Ensure Node.js runtime and dynamic responses for streaming
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Singleton transport and server across requests (per process)
-let transport: StreamableHTTPServerTransport | undefined;
-let connected = false;
+// Per-process single MCP server instance, but session-scoped HTTP transports
 let baseUrlForServer: string | undefined;
-let serverInitialized = false;
+let serverInstance: ReturnType<typeof createServer> | undefined;
+const transports = new Map<string, StreamableHTTPServerTransport>();
 
 // Simple event emitter for our ServerResponse shim
 type Handler = (...args: any[]) => void;
@@ -113,19 +113,11 @@ function createRequestBridge(req: NextRequest) {
 }
 
 async function ensureServer(req: NextRequest) {
-	if (!transport) {
-		transport = new StreamableHTTPServerTransport({
-			sessionIdGenerator: () => crypto.randomUUID(),
-		});
-	}
-	if (!connected) {
+	if (!serverInstance) {
 		// Base URL from request origin
 		const url = new URL(req.url);
 		baseUrlForServer = `${url.protocol}//${url.host}`;
-		const server = createServer(baseUrlForServer);
-		await server.connect(transport);
-		connected = true;
-		serverInitialized = true;
+		serverInstance = createServer(baseUrlForServer);
 	}
 }
 
@@ -140,13 +132,24 @@ function parseBodySafe(req: NextRequest): Promise<any | undefined> {
 
 export async function GET(req: NextRequest) {
 	await ensureServer(req);
+	const sessionId = req.headers.get('mcp-session-id') ?? undefined;
+
+	// Require a valid session for GET (SSE notifications)
+	if (!sessionId || !transports.has(sessionId)) {
+		const headers = new Headers();
+		const origin = req.headers.get('origin') ?? '*';
+		headers.set('Access-Control-Allow-Origin', origin);
+		headers.set('Vary', 'Origin');
+		headers.set('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version');
+		return new Response('Invalid or missing session ID', { status: 400, headers });
+	}
+
+	const transport = transports.get(sessionId)!;
 	const nodeReq = createRequestBridge(req);
 	const { res, headPromise } = createResponseBridge();
 
-	// Call transport with our shims
 	// We intentionally don't await handleRequest; we only await headers to return a Response
-	transport!.handleRequest(nodeReq as any, res as any).catch((err) => {
-		// Best-effort error: send 500 if headers not yet committed
+	transport.handleRequest(nodeReq as any, res as any).catch((err) => {
 		try {
 			(res as any).writeHead?.(500, { 'Content-Type': 'application/json' });
 			(res as any).end?.(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Internal Server Error', data: String(err) }, id: null }));
@@ -154,7 +157,6 @@ export async function GET(req: NextRequest) {
 	});
 
 	const { status, headers } = await headPromise;
-	// Basic CORS for browser-based MCP clients/Inspector
 	const origin = req.headers.get('origin') ?? '*';
 	headers.set('Access-Control-Allow-Origin', origin);
 	headers.set('Vary', 'Origin');
@@ -168,7 +170,44 @@ export async function POST(req: NextRequest) {
 	const parsedBody = await parseBodySafe(req);
 	const { res, headPromise } = createResponseBridge();
 
-	transport!.handleRequest(nodeReq as any, res as any, parsedBody).catch((err) => {
+	// Determine or create transport based on session and initialize request
+	const incomingSessionId = req.headers.get('mcp-session-id') ?? undefined;
+	let transport: StreamableHTTPServerTransport | undefined = undefined;
+
+	// 1) If this is an initialize request, always create a new session — even if a stale
+	//    Mcp-Session-Id header was sent by the client.
+	if (parsedBody && isInitializeRequest(parsedBody)) {
+		transport = new StreamableHTTPServerTransport({
+			sessionIdGenerator: () => crypto.randomUUID(),
+			onsessioninitialized: (sid: string) => {
+				transports.set(sid, transport!);
+			},
+		});
+		transport.onclose = () => {
+			if (transport && transport.sessionId) {
+				transports.delete(transport.sessionId);
+			}
+		};
+		await serverInstance!.connect(transport);
+	} else if (incomingSessionId && transports.has(incomingSessionId)) {
+		// 2) For non-initialize requests, a valid existing session is required
+		transport = transports.get(incomingSessionId)!;
+	}
+
+	if (!transport) {
+		const headers = new Headers();
+		const origin = req.headers.get('origin') ?? '*';
+		headers.set('Access-Control-Allow-Origin', origin);
+		headers.set('Vary', 'Origin');
+		headers.set('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version');
+		return new Response(
+			JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID provided' }, id: null }),
+			{ status: 400, headers }
+		);
+	}
+
+	// Bridge to transport
+	transport.handleRequest(nodeReq as any, res as any, parsedBody).catch((err) => {
 		try {
 			(res as any).writeHead?.(500, { 'Content-Type': 'application/json' });
 			(res as any).end?.(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Internal Server Error', data: String(err) }, id: null }));
@@ -176,20 +215,37 @@ export async function POST(req: NextRequest) {
 	});
 
 	const { status, headers } = await headPromise;
-	// Basic CORS for browser-based MCP clients/Inspector
 	const origin = req.headers.get('origin') ?? '*';
 	headers.set('Access-Control-Allow-Origin', origin);
 	headers.set('Vary', 'Origin');
 	headers.set('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version');
+
+	// After initialize, cache the transport by sessionId if available
+	if (!incomingSessionId && transport.sessionId && !transports.has(transport.sessionId)) {
+		transports.set(transport.sessionId, transport);
+	}
+
 	return new Response((res as any).readable, { status, headers });
 }
 
 export async function DELETE(req: NextRequest) {
 	await ensureServer(req);
+	const sessionId = req.headers.get('mcp-session-id') ?? undefined;
+
+	if (!sessionId || !transports.has(sessionId)) {
+		const headers = new Headers();
+		const origin = req.headers.get('origin') ?? '*';
+		headers.set('Access-Control-Allow-Origin', origin);
+		headers.set('Vary', 'Origin');
+		headers.set('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version');
+		return new Response('Invalid or missing session ID', { status: 400, headers });
+	}
+
+	const transport = transports.get(sessionId)!;
 	const nodeReq = createRequestBridge(req);
 	const { res, headPromise } = createResponseBridge();
 
-	transport!.handleRequest(nodeReq as any, res as any).catch((err) => {
+	transport.handleRequest(nodeReq as any, res as any).catch((err) => {
 		try {
 			(res as any).writeHead?.(500, { 'Content-Type': 'application/json' });
 			(res as any).end?.(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Internal Server Error', data: String(err) }, id: null }));
@@ -197,11 +253,11 @@ export async function DELETE(req: NextRequest) {
 	});
 
 	const { status, headers } = await headPromise;
-	// Basic CORS for browser-based MCP clients/Inspector
 	const origin = req.headers.get('origin') ?? '*';
 	headers.set('Access-Control-Allow-Origin', origin);
 	headers.set('Vary', 'Origin');
 	headers.set('Access-Control-Expose-Headers', 'Mcp-Session-Id, Mcp-Protocol-Version');
+
 	return new Response((res as any).readable, { status, headers });
 }
 
